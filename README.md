@@ -88,26 +88,26 @@ komac update -i Package.Identifier -v 1.2.3 --urls https://www.firstUrl.com http
 While other manifest creation tools have made remarkable strides in the winget-pkgs community, their development pace is
 notably slow and lacks the advanced detection capabilities that come with Komac.
 
-|                                          | Komac  | WingetCreate |                           YamlCreate                           |
-|------------------------------------------|:------:|:------------:|:--------------------------------------------------------------:|
-| Parameters                               |   ✅    |      ✅       |                               ❌                                |
-| Works without Git                        |   ✅    |      ✅       |                               ❌                                |
-| Optimised manifest ordering [^1]         |   ✅    |      ✅️      |                               ✅                                |
-| Fully cross-platform                     |   ✅    |      ❌       |                            Limited                             |
-| Full MSI value retrieval                 |   ✅    |   Partial    |                            Partial                             |
-| Linux & macOS MSI support                |   ✅    |      ❌       |                               ❌                                |
-| Full MSIX value retrieval                |   ✅    |   Partial    |   Partial - https://github.com/Trenly/winget-pkgs/issues/180   |
-| Get information from GitHub              |   ✅    |      ❌       |                               ❌                                |
-| Formatted GitHub release notes retrieval |   ✅    |      ❌       |                               ❌                                |
-| Release date identification              |   ✅    |      ❌       |                               ❌                                |
-| No telemetry                             |   ✅    |    ⭕ [^2]    |                               ✅                                |
-| Fully standalone (w/o winget-pkgs clone) |   ✅    |      ✅       |                               ❌                                |
-| Type-safety                              |   ✅    |      ✅       |                               ❌                                |
-| Inno setup detection                     | ✅ [^3] |      ✅       |                             ✅ [^4]                             |
-| Nullsoft detection                       | ✅ [^3] |      ✅       |                             ✅ [^4]                             |
+|                                          | Komac   | WingetCreate   |                           YamlCreate                           |
+|------------------------------------------|:-------:|:--------------:|:--------------------------------------------------------------:|
+| Parameters                               |   ✅    |      ✅       |                               ❌                               |
+| Works without Git                        |   ✅    |      ✅       |                               ❌                               |
+| Optimised manifest ordering [^1]         |   ✅    |      ✅️       |                               ✅                               |
+| Fully cross-platform                     |   ✅    |      ✅       |                            Limited                             |
+| Full MSI value retrieval                 |   ✅    |      ✅       |                            Partial                             |
+| Linux & macOS MSI support                |   ✅    |      ✅       |                               ❌                              |
+| Full MSIX value retrieval                |   ✅    |      ✅       |   Partial - https://github.com/Trenly/winget-pkgs/issues/180   |
+| Get information from GitHub              |   ✅    |      ✅       |                               ❌                              |
+| Formatted GitHub release notes retrieval |   ✅    |      ❌       |                               ❌                              |
+| Release date identification              |   ✅    |      ✅       |                               ❌                              |
+| No telemetry                             |   ✅    |    ⭕ [^2]    |                               ✅                              |
+| Fully standalone (w/o winget-pkgs clone) |   ✅    |      ✅       |                               ❌                              |
+| Type-safety                              |   ✅    |      ✅       |                               ❌                              |
+| Inno setup detection                     | ✅ [^3] |      ✅       |                             ✅ [^4]                           |
+| Nullsoft detection                       | ✅ [^3] |      ✅       |                             ✅ [^4]                           |
 | Burn installer detection                 | ✅ [^3] |      ✅       | Opt-in feature (not enabled by default due to slow processing) |
-| Progress bar & ETA while downloading     |   ✅    |      ❌       |                               ❌                                |
-| Programming Language                     |  Rust  |      C#      |                           PowerShell                           |
+| Progress bar & ETA while downloading     |   ✅    |      ❌       |                               ❌                              |
+| Programming Language                     |  Rust   |       C#       |                           PowerShell                           |
 
 [^1]: If all installers have the same value, that value is put at the root of the manifest to reduce redundancy.
 [^2]: Telemetry is enabled by default in WingetCreate. Use `wingetcreate settings` to manually disable telemetry.
