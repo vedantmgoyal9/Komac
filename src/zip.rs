@@ -1,92 +1,119 @@
 use crate::file_analyser::FileAnalyser;
-use crate::installer_manifest::{InstallerType, NestedInstallerFiles};
-use crate::url_utils::VALID_FILE_EXTENSIONS;
-use async_tempfile::TempFile;
-use async_zip::tokio::read::seek::ZipFileReader;
+use crate::manifests::installer_manifest::{NestedInstallerFiles, NestedInstallerType};
+use crate::types::architecture::Architecture;
+use camino::{Utf8Path, Utf8PathBuf};
 use color_eyre::eyre::Result;
+use inquire::{min_length, MultiSelect};
+use memmap2::Mmap;
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
-use tokio::fs::File;
-use tokio::io;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
+use std::io::{Cursor, Read, Seek};
+use std::{io, mem};
+use zip::ZipArchive;
+
+const VALID_NESTED_FILE_EXTENSIONS: [&str; 6] =
+    ["msix", "msi", "appx", "exe", "msixbundle", "appxbundle"];
 
 pub struct Zip {
-    pub nested_installer_type: Option<InstallerType>,
+    pub nested_installer_type: Option<NestedInstallerType>,
     pub nested_installer_files: Option<BTreeSet<NestedInstallerFiles>>,
+    pub architecture: Option<Architecture>,
+    pub identified_files: Vec<Utf8PathBuf>,
 }
 
 impl Zip {
-    pub async fn new(file: &mut File) -> Result<Zip> {
-        let mut zip = ZipFileReader::with_tokio(file).await?;
+    pub fn new<R: Read + Seek>(reader: R) -> Result<Self> {
+        let mut zip = ZipArchive::new(reader)?;
 
-        let file_names = zip
-            .file()
-            .entries()
-            .iter()
-            .flat_map(|stored_entry| stored_entry.entry().filename().as_str().ok())
-            .collect::<Vec<_>>();
-
-        let mut identified_files = file_names
-            .iter()
+        let identified_files = zip
+            .file_names()
+            .map(Utf8Path::new)
             .filter(|file_name| {
-                VALID_FILE_EXTENSIONS
-                    .into_iter()
-                    .any(|file_extension| file_name.ends_with(&format!(".{file_extension}")))
+                VALID_NESTED_FILE_EXTENSIONS.iter().any(|file_extension| {
+                    file_name.extension().map_or(false, |extension| {
+                        extension.eq_ignore_ascii_case(file_extension)
+                    })
+                })
             })
+            .map(Utf8Path::to_path_buf)
             .collect::<Vec<_>>();
 
-        let installer_type_counts = VALID_FILE_EXTENSIONS
+        let installer_type_counts = VALID_NESTED_FILE_EXTENSIONS
             .iter()
             .map(|file_extension| {
                 (
                     file_extension,
-                    file_names
-                        .iter()
-                        .filter(|file_name| file_name.ends_with(&format!(".{file_extension}")))
+                    zip.file_names()
+                        .filter(|file_name| {
+                            Utf8Path::new(file_name)
+                                .extension()
+                                .map_or(false, |extension| {
+                                    extension.eq_ignore_ascii_case(file_extension)
+                                })
+                        })
                         .count(),
                 )
             })
             .collect::<HashMap<_, _>>();
 
+        let mut nested_installer_type = None;
+        let mut architecture = None;
+
+        // If there's only one valid file in the zip, extract and analyse it
         if installer_type_counts
             .values()
             .filter(|&&count| count == 1)
             .count()
             == 1
         {
-            let mut nested_installer_type = None;
-            let chosen_file_name = identified_files.swap_remove(0).to_string();
-            for index in 0..zip.file().entries().len() {
-                if get_entry_file_name(&zip, index) == chosen_file_name {
-                    let entry_reader = zip.reader_without_entry(index).await?;
-                    let temp_file = TempFile::new_with_name(&chosen_file_name).await?;
-                    io::copy(&mut entry_reader.compat(), &mut temp_file.open_rw().await?).await?;
-                    let file_analyser = FileAnalyser::new(&mut temp_file.open_ro().await?).await?;
-                    nested_installer_type = Some(file_analyser.installer_type);
-                    break;
-                }
+            let chosen_file_name = identified_files.first().unwrap();
+            if let Ok(mut chosen_file) = zip.by_name(chosen_file_name.as_str()) {
+                let mut temp_file = tempfile::tempfile()?;
+                io::copy(&mut chosen_file, &mut temp_file)?;
+                let map = unsafe { Mmap::map(&temp_file) }?;
+                let cursor = Cursor::new(map.as_ref());
+                let file_analyser =
+                    FileAnalyser::new(cursor, Cow::Borrowed(chosen_file_name.as_str()))?;
+                nested_installer_type = file_analyser.installer_type.to_nested();
+                architecture = file_analyser.architecture;
             }
-            return Ok(Zip {
+            return Ok(Self {
                 nested_installer_type,
                 nested_installer_files: Some(BTreeSet::from([NestedInstallerFiles {
-                    relative_file_path: chosen_file_name.to_string(),
+                    relative_file_path: chosen_file_name.clone(),
                     portable_command_alias: None,
                 }])),
+                architecture,
+                identified_files,
             });
         }
 
-        Ok(Zip {
-            nested_installer_type: None,
+        Ok(Self {
+            nested_installer_type,
             nested_installer_files: None,
+            architecture,
+            identified_files,
         })
     }
 
-    pub fn prompt() {}
-}
-
-pub fn get_entry_file_name<'a>(zip: &'a ZipFileReader<&mut File>, index: usize) -> &'a str {
-    zip.file()
-        .entries()
-        .get(index)
-        .and_then(|stored_entry| stored_entry.entry().filename().as_str().ok())
-        .unwrap_or_default()
+    pub fn prompt(&mut self) -> Result<()> {
+        if !&self.identified_files.is_empty() {
+            let chosen = MultiSelect::new(
+                "Select the nested files",
+                mem::take(&mut self.identified_files),
+            )
+            .with_validator(min_length!(1))
+            .prompt()?;
+            self.nested_installer_files = Some(
+                chosen
+                    .into_iter()
+                    .map(|path| NestedInstallerFiles {
+                        relative_file_path: path,
+                        portable_command_alias: None, // Prompt if portable
+                    })
+                    .collect(),
+            );
+        }
+        Ok(())
+    }
 }

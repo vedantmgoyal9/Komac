@@ -1,7 +1,7 @@
-use crate::default_locale_manifest::DefaultLocaleManifest;
-use crate::installer_manifest::InstallerManifest;
-use crate::locale_manifest::LocaleManifest;
-use crate::version_manifest::VersionManifest;
+use crate::manifests::default_locale_manifest::DefaultLocaleManifest;
+use crate::manifests::installer_manifest::InstallerManifest;
+use crate::manifests::locale_manifest::LocaleManifest;
+use crate::manifests::version_manifest::VersionManifest;
 use clap::{crate_name, crate_version};
 use color_eyre::eyre::{Error, Result};
 use const_format::formatcp;
@@ -10,7 +10,7 @@ use std::io::StdoutLock;
 use std::io::Write;
 use std::{env, io};
 
-pub const MANIFEST_VERSION: &str = "1.5.0";
+pub const MANIFEST_VERSION: &str = "1.6.0";
 
 const INSTALLER_SCHEMA: &str =
     formatcp!("https://aka.ms/winget-manifest.installer.{MANIFEST_VERSION}.schema.json");
@@ -28,10 +28,21 @@ pub enum Manifest<'a> {
     Version(&'a VersionManifest),
 }
 
-pub fn print_changes(changes: &Vec<(String, String)>) {
+impl Manifest<'_> {
+    const fn schema(&self) -> &str {
+        match self {
+            Manifest::Installer(_) => INSTALLER_SCHEMA,
+            Manifest::DefaultLocale(_) => DEFAULT_LOCALE_SCHEMA,
+            Manifest::Locale(_) => LOCALE_SCHEMA,
+            Manifest::Version(_) => VERSION_SCHEMA,
+        }
+    }
+}
+
+pub fn print_changes<'a>(contents: impl Iterator<Item = &'a str>) {
     let mut lock = io::stdout().lock();
 
-    for (_, content) in changes {
+    for content in contents {
         print_manifest(&mut lock, content);
         let _ = writeln!(lock);
     }
@@ -53,21 +64,16 @@ fn print_manifest(lock: &mut StdoutLock, manifest: &str) {
     }
 }
 
-pub fn build_manifest_string(manifest: Manifest) -> Result<String> {
+pub fn build_manifest_string(manifest: &Manifest, created_with: &Option<String>) -> Result<String> {
     let mut result = Vec::from("# Created with ");
-    if let Ok(created_with_tool) = env::var("KOMAC_CREATED_WITH") {
+    if let Some(created_with_tool) = created_with {
         write!(result, "{created_with_tool} using ")?;
     }
     writeln!(result, "{} v{}", crate_name!(), crate_version!())?;
     writeln!(
         result,
         "# yaml-language-server: $schema={}",
-        match manifest {
-            Manifest::Installer(_) => INSTALLER_SCHEMA,
-            Manifest::DefaultLocale(_) => DEFAULT_LOCALE_SCHEMA,
-            Manifest::Locale(_) => LOCALE_SCHEMA,
-            Manifest::Version(_) => VERSION_SCHEMA,
-        }
+        manifest.schema()
     )?;
     writeln!(result)?;
     match manifest {
@@ -100,8 +106,8 @@ fn convert_to_crlf(buf: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::installer_manifest::InstallerManifest;
     use crate::manifest::{build_manifest_string, Manifest};
+    use crate::manifests::installer_manifest::InstallerManifest;
 
     fn contains_newline_not_preceded_by_carriage_return(value: &str) -> bool {
         value
@@ -114,7 +120,7 @@ mod tests {
     fn test_build_manifest_string_crlf() {
         let binding = InstallerManifest::default();
         let installer_manifest = Manifest::Installer(&binding);
-        let manifest_string = build_manifest_string(installer_manifest).unwrap();
+        let manifest_string = build_manifest_string(&installer_manifest, &None).unwrap();
         assert!(!contains_newline_not_preceded_by_carriage_return(
             &manifest_string
         ));

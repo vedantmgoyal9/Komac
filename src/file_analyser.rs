@@ -1,221 +1,256 @@
-use crate::installer_manifest::{Architecture, InstallerType, UpgradeBehavior};
+use crate::exe::vs_version_info::VSVersionInfo;
+use crate::manifests::installer_manifest::{Platform, Scope};
 use crate::msi::Msi;
 use crate::msix_family::msix::Msix;
 use crate::msix_family::msixbundle::MsixBundle;
-use async_tempfile::TempFile;
-use color_eyre::eyre::{bail, Result};
-use exe::ResolvedDirectoryID::Name;
-use exe::{CCharString, NTHeaders, PETranslation, ResourceDirectory, VecPE, PE};
-use std::ffi::OsStr;
-use std::io::SeekFrom;
-use tokio::io;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use crate::types::architecture::Architecture;
+use crate::types::copyright::Copyright;
+use crate::types::installer_type::InstallerType;
+use crate::types::language_tag::LanguageTag;
+use crate::types::minimum_os_version::MinimumOSVersion;
+use crate::types::package_name::PackageName;
+use crate::types::publisher::Publisher;
+use crate::zip::Zip;
+use camino::Utf8Path;
+use chrono::NaiveDate;
+use color_eyre::eyre::{Error, OptionExt, Result};
+use object::pe::{ImageNtHeaders64, ImageResourceDirectoryEntry, RT_RCDATA};
+use object::read::pe::{
+    ImageNtHeaders, PeFile, PeFile32, PeFile64, ResourceDirectory, ResourceDirectoryEntryData,
+};
+use object::{FileKind, LittleEndian, ReadCache, ReadRef};
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+use std::io::{Cursor, Read, Seek};
+use std::mem;
 
-const NULLSOFT_BYTES_LEN: usize = 224;
+pub const EXE: &str = "exe";
+pub const MSI: &str = "msi";
+pub const MSIX: &str = "msix";
+pub const APPX: &str = "appx";
+pub const MSIX_BUNDLE: &str = "msixbundle";
+pub const APPX_BUNDLE: &str = "appxbundle";
+pub const ZIP: &str = "zip";
 
-/// The first 224 bytes of an exe made with NSIS are always the same
-const NULLSOFT_BYTES: [u8; NULLSOFT_BYTES_LEN] = [
-    77, 90, 144, 0, 3, 0, 0, 0, 4, 0, 0, 0, 255, 255, 0, 0, 184, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    216, 0, 0, 0, 14, 31, 186, 14, 0, 180, 9, 205, 33, 184, 1, 76, 205, 33, 84, 104, 105, 115, 32,
-    112, 114, 111, 103, 114, 97, 109, 32, 99, 97, 110, 110, 111, 116, 32, 98, 101, 32, 114, 117,
-    110, 32, 105, 110, 32, 68, 79, 83, 32, 109, 111, 100, 101, 46, 13, 13, 10, 36, 0, 0, 0, 0, 0,
-    0, 0, 173, 49, 8, 129, 233, 80, 102, 210, 233, 80, 102, 210, 233, 80, 102, 210, 42, 95, 57,
-    210, 235, 80, 102, 210, 233, 80, 103, 210, 76, 80, 102, 210, 42, 95, 59, 210, 230, 80, 102,
-    210, 189, 115, 86, 210, 227, 80, 102, 210, 46, 86, 96, 210, 232, 80, 102, 210, 82, 105, 99,
-    104, 233, 80, 102, 210, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    80, 69, 0, 0, 76, 1, 5, 0,
-];
-
-const INNO_BYTES_LEN: usize = 264;
-
-/// The first 264 bytes of an exe made with Inno Setup are always the same
-const INNO_BYTES: [u8; INNO_BYTES_LEN] = [
-    77, 90, 80, 0, 2, 0, 0, 0, 4, 0, 15, 0, 255, 255, 0, 0, 184, 0, 0, 0, 0, 0, 0, 0, 64, 0, 26, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 1, 0, 0, 186, 16, 0, 14, 31, 180, 9, 205, 33, 184, 1, 76, 205, 33, 144, 144, 84, 104, 105,
-    115, 32, 112, 114, 111, 103, 114, 97, 109, 32, 109, 117, 115, 116, 32, 98, 101, 32, 114, 117,
-    110, 32, 117, 110, 100, 101, 114, 32, 87, 105, 110, 51, 50, 13, 10, 36, 55, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 80, 69, 0, 0, 76, 1, 10, 0,
-];
-
-const EXE: &str = "exe";
-const MSI: &str = "msi";
-const MSIX: &str = "msix";
-const APPX: &str = "appx";
-const MSIX_BUNDLE: &str = "msixbundle";
-const APPX_BUNDLE: &str = "appxbundle";
-const ZIP: &str = "zip";
-
-pub struct FileAnalyser {
+pub struct FileAnalyser<'a> {
+    pub platform: Option<BTreeSet<Platform>>,
+    pub minimum_os_version: Option<MinimumOSVersion>,
+    pub architecture: Option<Architecture>,
     pub installer_type: InstallerType,
+    pub scope: Option<Scope>,
+    pub installer_sha_256: String,
+    pub signature_sha_256: Option<String>,
+    pub package_family_name: Option<String>,
+    pub product_code: Option<String>,
+    pub product_language: Option<LanguageTag>,
+    pub last_modified: Option<NaiveDate>,
+    pub file_name: Cow<'a, str>,
+    pub copyright: Option<Copyright>,
+    pub package_name: Option<PackageName>,
+    pub publisher: Option<Publisher>,
     pub msi: Option<Msi>,
-    pub msix: Option<Msix>,
-    pub msix_bundle: Option<MsixBundle>,
-    pub pe: Option<VecPE>,
+    pub zip: Option<Zip>,
 }
 
-impl FileAnalyser {
-    pub async fn new(file: &mut TempFile) -> Result<FileAnalyser> {
-        let path = file.file_path();
-        let extension = path
+impl<'a> FileAnalyser<'a> {
+    pub fn new<R: Read + Seek>(mut reader: R, file_name: Cow<'a, str>) -> Result<Self> {
+        let extension = Utf8Path::new(file_name.as_ref())
             .extension()
-            .and_then(OsStr::to_str)
             .unwrap_or_default()
             .to_lowercase();
-        let pe = (extension == EXE)
-            .then(|| VecPE::from_disk_file(path))
-            .transpose()?;
-        let mut msi = (extension == MSI).then(|| Msi::new(path)).transpose()?;
-        let msix = match extension.as_str() {
-            MSIX | APPX => Some(Msix::new(file).await),
+        let mut installer_type = None;
+        let mut msi = match extension.as_str() {
+            MSI => Some(Msi::new(&mut reader)?),
             _ => None,
+        };
+        let mut pe_arch = None;
+        let mut string_map = None;
+        let read_ref = ReadCache::new(&mut reader);
+        match (extension == EXE)
+            .then(|| FileKind::parse(&read_ref).ok())
+            .flatten()
+        {
+            Some(FileKind::Pe32) => {
+                let pe_file = PeFile32::parse(&read_ref)?;
+                installer_type = Some(InstallerType::get(
+                    Some(&pe_file),
+                    &extension,
+                    msi.as_ref(),
+                )?);
+                if let Ok((msi_resource, resource_directory)) = get_msi_resource(&pe_file) {
+                    installer_type = Some(InstallerType::Burn);
+                    msi = Some(extract_msi(&pe_file, msi_resource, resource_directory)?);
+                }
+                pe_arch = Some(Architecture::get_from_exe(&pe_file)?);
+                string_map = VSVersionInfo::parse(&pe_file)
+                    .ok()
+                    .and_then(|vs_version_info| vs_version_info.string_file_info)
+                    .map(|mut string_file_info| {
+                        string_file_info.children.swap_remove(0).string_map()
+                    });
+            }
+            Some(FileKind::Pe64) => {
+                let pe_file = PeFile64::parse(&read_ref)?;
+                installer_type = Some(InstallerType::get(
+                    Some(&pe_file),
+                    &extension,
+                    msi.as_ref(),
+                )?);
+                if let Ok((msi_resource, resource_directory)) = get_msi_resource(&pe_file) {
+                    installer_type = Some(InstallerType::Burn);
+                    msi = Some(extract_msi(&pe_file, msi_resource, resource_directory)?);
+                }
+                pe_arch = Some(Architecture::get_from_exe(&pe_file)?);
+                string_map = VSVersionInfo::parse(&pe_file)
+                    .ok()
+                    .and_then(|vs_version_info| vs_version_info.string_file_info)
+                    .map(|mut string_file_info| {
+                        string_file_info.children.swap_remove(0).string_map()
+                    });
+            }
+            _ => {}
         }
-        .transpose()?;
-        let msix_bundle = match extension.as_str() {
-            MSIX_BUNDLE | APPX_BUNDLE => Some(MsixBundle::new(file).await),
+        let mut msix = match extension.as_str() {
+            MSIX | APPX => Some(Msix::new(&mut reader)?),
             _ => None,
+        };
+        let mut msix_bundle = match extension.as_str() {
+            MSIX_BUNDLE | APPX_BUNDLE => Some(MsixBundle::new(&mut reader)?),
+            _ => None,
+        };
+        let mut zip = match extension.as_str() {
+            ZIP => Some(Zip::new(reader)?),
+            _ => None,
+        };
+        if installer_type.is_none() {
+            installer_type = Some(InstallerType::get::<ImageNtHeaders64, &[u8]>(
+                None::<&PeFile<'_, ImageNtHeaders64, &[u8]>>,
+                &extension,
+                msi.as_ref(),
+            )?);
         }
-        .transpose()?;
-        let installer_type = get_installer_type(file, &extension, &msi, &pe).await?;
-        if installer_type == InstallerType::Burn {
-            if let Some(ref pe) = pe {
-                msi = Some(extract_msi(file, pe).await?);
-            }
-        }
-        Ok(FileAnalyser {
-            installer_type,
-            msi,
-            msix,
-            msix_bundle,
-            pe,
-        })
-    }
-}
-
-async fn extract_msi(file: &mut TempFile, pe: &VecPE) -> Result<Msi> {
-    let msi_entry = ResourceDirectory::parse(pe)?
-        .resources
-        .into_iter()
-        .find(|entry| entry.rsrc_id == Name(MSI.to_uppercase()))
-        .unwrap()
-        .get_data_entry(pe)?;
-    let msi_name = format!(
-        "{}.{}",
-        file.file_path()
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or_default(),
-        MSI
-    );
-    let mut extracted_msi = TempFile::new_with_name(msi_name).await?.open_rw().await?;
-    // Translate the offset into a usable one
-    let offset = pe.translate(PETranslation::Memory(msi_entry.offset_to_data))?;
-
-    // Seek to the MSI offset
-    file.seek(SeekFrom::Start(offset as u64)).await?;
-
-    // Asynchronously write the MSI to the temporary MSI file
-    let mut take = file.take(msi_entry.size as u64);
-    io::copy(&mut take, &mut extracted_msi).await?;
-
-    let msi = Msi::new(extracted_msi.file_path())?;
-    Ok(msi)
-}
-
-pub fn get_architecture(pe: &VecPE) -> Result<Architecture> {
-    let machine = match pe.get_valid_nt_headers()? {
-        NTHeaders::NTHeaders32(nt_header) => nt_header.file_header.machine,
-        NTHeaders::NTHeaders64(nt_header) => nt_header.file_header.machine,
-    };
-    // https://learn.microsoft.com/windows/win32/debug/pe-format#machine-types
-    Ok(match machine {
-        34404 => Architecture::X64,           // 0x8664
-        332 => Architecture::X86,             // 0x14c
-        43620 => Architecture::Arm64,         // 0xaa64
-        448 | 450 | 452 => Architecture::Arm, // 0x1c0 | 0x1c2 | 0x1c4
-        0 => Architecture::Neutral,           // 0x0
-        _ => bail!("Unknown machine value {:04x}", machine),
-    })
-}
-
-async fn get_installer_type(
-    file: &mut TempFile,
-    extension: &str,
-    msi: &Option<Msi>,
-    pe: &Option<VecPE>,
-) -> Result<InstallerType> {
-    match extension {
-        MSI => {
-            if let Some(msi) = msi {
-                return Ok(match msi.is_wix {
-                    true => InstallerType::Wix,
-                    false => InstallerType::Msi,
-                });
-            }
-        }
-        MSIX | MSIX_BUNDLE => return Ok(InstallerType::Msix),
-        APPX | APPX_BUNDLE => return Ok(InstallerType::Appx),
-        ZIP => return Ok(InstallerType::Zip),
-        EXE => {
-            // Check if the file is Inno or Nullsoft from their magic bytes
-            let mut buffer = [0; INNO_BYTES_LEN];
-            file.seek(SeekFrom::Start(0)).await?;
-            file.read_exact(&mut buffer).await?;
-            match () {
-                _ if buffer == INNO_BYTES => return Ok(InstallerType::Inno),
-                _ if buffer[..NULLSOFT_BYTES_LEN] == NULLSOFT_BYTES => {
-                    return Ok(InstallerType::Nullsoft)
-                }
-                _ => {}
-            };
-            if let Some(pe) = pe {
-                match () {
-                    _ if has_msi_resource(pe) => return Ok(InstallerType::Burn),
-                    _ if has_burn_header(pe) => return Ok(InstallerType::Burn),
-                    _ => {}
-                }
-            }
-            return Ok(InstallerType::Exe);
-        }
-        _ => {}
-    }
-    bail!("Unsupported file extension {extension}")
-}
-
-fn has_msi_resource(pe: &VecPE) -> bool {
-    ResourceDirectory::parse(pe)
-        .map(|resource_directory| {
-            resource_directory
-                .resources
-                .iter()
-                .any(|entry| match &entry.rsrc_id {
-                    Name(value) => value.to_lowercase() == MSI,
-                    _ => false,
+        Ok(Self {
+            platform: msix
+                .as_ref()
+                .map(|msix| BTreeSet::from([msix.target_device_family])),
+            minimum_os_version: msix.as_mut().map(|msix| mem::take(&mut msix.min_version)),
+            architecture: msi
+                .as_ref()
+                .map(|msi| msi.architecture)
+                .or_else(|| msix.as_ref().map(|msix| msix.processor_architecture))
+                .or_else(|| {
+                    msix_bundle.as_ref().and_then(|bundle| {
+                        bundle
+                            .packages
+                            .iter()
+                            .find_map(|package| package.processor_architecture)
+                    })
                 })
+                .or(pe_arch)
+                .or_else(|| {
+                    zip.as_mut()
+                        .and_then(|zip| mem::take(&mut zip.architecture))
+                }),
+            installer_type: installer_type.unwrap(),
+            scope: msi.as_ref().and_then(|msi| msi.all_users),
+            installer_sha_256: String::new(),
+            signature_sha_256: msix
+                .as_mut()
+                .map(|msix| mem::take(&mut msix.signature_sha_256))
+                .or_else(|| {
+                    msix_bundle
+                        .as_mut()
+                        .map(|msix_bundle| mem::take(&mut msix_bundle.signature_sha_256))
+                }),
+            package_family_name: msix
+                .map(|msix| msix.package_family_name)
+                .or_else(|| msix_bundle.map(|msix_bundle| msix_bundle.package_family_name)),
+            product_code: msi.as_mut().map(|msi| mem::take(&mut msi.product_code)),
+            product_language: msi.as_mut().map(|msi| mem::take(&mut msi.product_language)),
+            last_modified: None,
+            file_name,
+            copyright: string_map.as_mut().and_then(Copyright::get_from_exe),
+            package_name: string_map.as_mut().and_then(PackageName::get_from_exe),
+            publisher: string_map.as_mut().and_then(Publisher::get_from_exe),
+            msi,
+            zip,
         })
-        .unwrap_or(false)
-}
-
-fn has_burn_header(pe: &VecPE) -> bool {
-    const WIX_BURN_HEADER: &str = ".wixburn";
-
-    pe.get_section_table()
-        .map(|section_table| {
-            section_table
-                .iter()
-                .any(|section| section.name.as_str().unwrap_or_default() == WIX_BURN_HEADER)
-        })
-        .unwrap_or(false)
-}
-
-pub fn get_upgrade_behavior(installer_type: &InstallerType) -> Option<UpgradeBehavior> {
-    match installer_type {
-        InstallerType::Msix | InstallerType::Appx => Some(UpgradeBehavior::Install),
-        _ => None,
     }
+}
+
+fn get_msi_resource<'data, Pe, R>(
+    pe: &PeFile<'data, Pe, R>,
+) -> Result<(&'data ImageResourceDirectoryEntry, ResourceDirectory<'data>)>
+where
+    Pe: ImageNtHeaders,
+    R: ReadRef<'data>,
+{
+    let resource_directory = pe
+        .data_directories()
+        .resource_directory(pe.data(), &pe.section_table())?
+        .ok_or_eyre("No resource directory was found")?;
+
+    let rc_data = resource_directory
+        .root()?
+        .entries
+        .iter()
+        .find(|entry| entry.name_or_id().id() == Some(RT_RCDATA))
+        .ok_or_eyre("No RT_RCDATA was found")?;
+
+    let msi_resource = rc_data.data(resource_directory)?.table().and_then(|table| {
+        table.entries.iter().find(|entry| {
+            entry
+                .name_or_id()
+                .name()
+                .and_then(|name| name.to_string_lossy(resource_directory).ok())
+                .as_deref()
+                == Some("MSI")
+        })
+    });
+
+    msi_resource.map_or_else(
+        || Err(Error::msg("No MSI resource was found")),
+        |entry| Ok((entry, resource_directory)),
+    )
+}
+
+pub fn extract_msi<'data, Pe, R>(
+    pe: &PeFile<'data, Pe, R>,
+    msi_resource: &'data ImageResourceDirectoryEntry,
+    resource_directory: ResourceDirectory,
+) -> Result<Msi>
+where
+    Pe: ImageNtHeaders,
+    R: ReadRef<'data>,
+{
+    let msi_entry = msi_resource
+        .data(resource_directory)?
+        .table()
+        .and_then(|table| table.entries.first())
+        .and_then(|entry| entry.data(resource_directory).ok())
+        .and_then(ResourceDirectoryEntryData::data)
+        .unwrap();
+
+    let section = pe
+        .section_table()
+        .section_containing(msi_entry.offset_to_data.get(LittleEndian))
+        .unwrap();
+
+    // Translate the offset into a usable one
+    let offset = {
+        let mut rva = msi_entry.offset_to_data.get(LittleEndian);
+        rva -= section.virtual_address.get(LittleEndian);
+        rva += section.pointer_to_raw_data.get(LittleEndian);
+        rva as usize
+    };
+
+    // Get the slice that represents the embedded MSI
+    let msi_data = Cursor::new(
+        pe.data()
+            .read_bytes_at(offset as u64, u64::from(msi_entry.size.get(LittleEndian)))
+            .unwrap(),
+    );
+
+    let msi = Msi::new(msi_data)?;
+    Ok(msi)
 }

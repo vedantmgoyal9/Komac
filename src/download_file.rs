@@ -1,40 +1,58 @@
-use crate::file_analyser::{get_architecture, FileAnalyser};
-use crate::installer_manifest::{Architecture, InstallerType};
-use crate::msi::Msi;
-use crate::msix_family::msix::Msix;
-use crate::msix_family::msixbundle::MsixBundle;
-use crate::url_utils::find_architecture;
-use async_tempfile::TempFile;
-use color_eyre::eyre::{eyre, Error, Result, WrapErr};
+use std::borrow::Cow;
+use std::cmp::min;
+use std::collections::HashMap;
+use std::fs::File;
+use std::future::Future;
+use std::io::Cursor;
+
+use camino::Utf8Path;
+use chrono::{DateTime, NaiveDate};
+use color_eyre::eyre::{bail, eyre, Result};
+use const_format::formatcp;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use itertools::Itertools;
+use memmap2::Mmap;
 use reqwest::header::{HeaderValue, CONTENT_DISPOSITION, LAST_MODIFIED};
-use reqwest::Client;
+use reqwest::{Client, Response};
 use sha2::{Digest, Sha256};
-use std::cmp::min;
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::future::Future;
-use time::format_description::well_known::Rfc2822;
-use time::{Date, OffsetDateTime};
 use tokio::io::AsyncWriteExt;
-use url::Url;
-use xxhash_rust::xxh3::xxh3_64;
+use uuid::Uuid;
 
-async fn download_file<'a>(
+use crate::file_analyser::FileAnalyser;
+use crate::types::urls::url::Url;
+use crate::url_utils::{find_architecture, VALID_FILE_EXTENSIONS};
+
+async fn download_file(
     client: &Client,
-    url: &'a str,
+    mut url: url::Url,
     multi_progress: &MultiProgress,
-) -> Result<DownloadedFile<'a>> {
-    let res = client
-        .get(url)
-        .send()
-        .await
-        .wrap_err_with(|| format!("Failed to GET from '{url}'"))?;
+) -> Result<DownloadedFile> {
+    if url.scheme() == "http" {
+        url.set_scheme("https").unwrap();
+        if client
+            .head(url.as_str())
+            .send()
+            .await
+            .and_then(Response::error_for_status)
+            .is_err()
+        {
+            url.set_scheme("http").unwrap();
+        }
+    }
+
+    let res = client.get(url.as_str()).send().await?;
+
+    if let Err(err) = res.error_for_status_ref() {
+        bail!(
+            "{} returned {}",
+            err.url().unwrap().as_str(),
+            err.status().unwrap()
+        )
+    }
 
     let content_disposition = res.headers().get(CONTENT_DISPOSITION);
-    let filename = get_file_name(url, content_disposition);
+    let file_name = get_file_name(&url, res.url(), content_disposition);
     let total_size = res
         .content_length()
         .ok_or_else(|| eyre!("Failed to get content length from '{url}'"))?;
@@ -43,24 +61,26 @@ async fn download_file<'a>(
         .headers()
         .get(LAST_MODIFIED)
         .and_then(|last_modified| last_modified.to_str().ok())
-        .and_then(|last_modified| OffsetDateTime::parse(last_modified, &Rfc2822).ok())
-        .map(OffsetDateTime::date);
+        .and_then(|last_modified| DateTime::parse_from_rfc2822(last_modified).ok())
+        .map(|date_time| date_time.date_naive());
 
-    let pb = multi_progress.add(ProgressBar::new(total_size));
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
-        .progress_chars("#>-"));
-    pb.set_message(format!("Downloading {url}"));
+    let pb = multi_progress.add(ProgressBar::new(total_size)
+        .with_style(ProgressStyle::default_bar()
+            .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
+            .progress_chars("#>-")
+        )
+        .with_message(format!("Downloading {url}"))
+    );
 
     // Download chunks
-    let temp_file = TempFile::new_with_name(filename).await?;
-    let mut file = temp_file.open_rw().await?;
+    let temp_file = tempfile::tempfile()?;
+    let mut file = tokio::fs::File::from_std(temp_file.try_clone()?);
     let mut downloaded = 0;
     let mut stream = res.bytes_stream();
 
     let mut hasher = Sha256::new();
     while let Some(item) = stream.next().await {
-        let chunk = item.wrap_err_with(|| "Error while downloading file")?;
+        let chunk = item?;
         let write = file.write_all(&chunk);
         hasher.update(&chunk); // Hash file as it's downloading
         let new = min(downloaded + (chunk.len() as u64), total_size);
@@ -71,97 +91,118 @@ async fn download_file<'a>(
     pb.finish_and_clear();
 
     Ok(DownloadedFile {
-        url,
-        file: temp_file.open_ro().await?,
+        url: url.into(),
+        file: temp_file,
         sha_256: base16ct::upper::encode_string(&hasher.finalize()),
+        file_name,
         last_modified,
     })
 }
 
-fn get_file_name(url: &str, content_disposition: Option<&HeaderValue>) -> String {
-    if let Some(content_disposition) = content_disposition.map(|s| s.to_str().unwrap_or_default()) {
-        let mut sections = content_disposition.split(';');
-        let _disposition = sections.next();
-        for section in sections {
-            let mut parts = section.splitn(2, '=');
+/// Gets the filename from a URL given the URL, a final redirected URL, and an optional
+/// Content-Disposition header.
+///
+/// This works by getting the filename from the Content-Disposition header. It aims to mimic
+/// Firefox's functionality whereby the filename* parameter is prioritised over filename even if
+/// both are provided. See [Content-Disposition](https://developer.mozilla.org/docs/Web/HTTP/Headers/Content-Disposition).
+///
+/// If there is no Content-Disposition header or no filenames in the Content-Disposition, it falls
+/// back to getting the last part of the initial URL and then the final redirected URL if the
+/// initial URL does not have a valid file extension at the end.
+fn get_file_name(
+    url: &url::Url,
+    final_url: &url::Url,
+    content_disposition: Option<&HeaderValue>,
+) -> String {
+    const FILENAME: &str = "filename";
+    const FILENAME_EXT: &str = formatcp!("{FILENAME}*");
 
-            let key = parts.next().map(str::trim);
-            let value = parts.next().map(str::trim);
-            if let (Some(key), Some(value)) = (key, value) {
-                if key.starts_with("filename") {
-                    return value.trim_matches('"').to_owned();
+    if let Some(content_disposition) = content_disposition.and_then(|value| value.to_str().ok()) {
+        let mut sections = content_disposition.split(';');
+        let _disposition = sections.next(); // Skip the disposition type
+        let filenames = sections
+            .filter_map(|section| {
+                let mut parts = section.splitn(2, '=').map(str::trim);
+                if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+                    if key.starts_with(FILENAME) {
+                        let value = value.trim_matches('"').trim();
+                        if !value.is_empty() {
+                            return Some((key, value));
+                        }
+                    }
                 }
-            } else {
-                break;
-            }
+                None
+            })
+            .collect::<Vec<_>>();
+
+        let filename = filenames
+            .iter()
+            .find_map(|&(key, value)| (key == FILENAME_EXT).then_some(value))
+            .or_else(|| {
+                filenames
+                    .into_iter()
+                    .find_map(|(key, value)| (key == FILENAME).then_some(value))
+            });
+        if let Some(filename) = filename {
+            return filename.to_owned();
         }
     }
-    if let Some((_, file_name)) = url.rsplit_once('/') {
-        file_name.to_owned()
-    } else {
-        xxh3_64(url.as_bytes()).to_string()
-    }
+
+    // Fallback if there is no Content-Disposition header or no filenames in Content-Disposition
+    url.path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|last_segment| {
+            Utf8Path::new(last_segment)
+                .extension()
+                .map_or(false, |extension| {
+                    VALID_FILE_EXTENSIONS.contains(&extension)
+                })
+        })
+        .or_else(|| {
+            final_url
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+        })
+        .map_or_else(|| Uuid::new_v4().to_string(), str::to_owned)
 }
 
 pub fn download_urls<'a>(
     client: &'a Client,
-    urls: &'a [Url],
+    urls: Vec<Url>,
     multi_progress: &'a MultiProgress,
-) -> impl Iterator<Item = impl Future<Output = Result<DownloadedFile<'a>>>> {
-    urls.iter()
+) -> impl Iterator<Item = impl Future<Output = Result<DownloadedFile>> + 'a> {
+    urls.into_iter()
         .unique()
-        .map(|url| download_file(client, url.as_str(), multi_progress))
+        .map(|url| download_file(client, url.into_inner(), multi_progress))
 }
 
-pub struct DownloadedFile<'a> {
-    pub url: &'a str,
-    pub file: TempFile,
+pub struct DownloadedFile {
+    pub url: Url,
+    pub file: File,
     pub sha_256: String,
-    pub last_modified: Option<Date>,
-}
-
-pub struct InitialData {
-    pub architecture: Architecture,
-    pub installer_type: InstallerType,
-    pub installer_sha_256: String,
-    pub last_modified: Option<Date>,
-    pub msi: Option<Msi>,
-    pub msix: Option<Msix>,
-    pub msix_bundle: Option<MsixBundle>,
     pub file_name: String,
+    pub last_modified: Option<NaiveDate>,
 }
 
-pub async fn process_files(files: Vec<DownloadedFile<'_>>) -> Result<HashMap<&str, InitialData>> {
+pub async fn process_files<'a>(
+    files: Vec<DownloadedFile>,
+) -> Result<HashMap<Url, FileAnalyser<'a>>> {
     stream::iter(files.into_iter().map(
         |DownloadedFile {
              url,
-             mut file,
+             file,
              sha_256,
+             file_name,
              last_modified,
          }| async move {
-            let file_analyser = FileAnalyser::new(&mut file).await?;
-            let initial_data = InitialData {
-                architecture: find_architecture(url)
-                    .or(file_analyser.msi.as_ref().map(|msi| msi.architecture))
-                    .or(file_analyser
-                        .msix
-                        .as_ref()
-                        .map(|msix| msix.processor_architecture))
-                    .unwrap_or_else(|| get_architecture(&file_analyser.pe.unwrap()).unwrap()),
-                installer_type: file_analyser.installer_type,
-                installer_sha_256: sha_256,
-                last_modified,
-                msi: file_analyser.msi,
-                msix: file_analyser.msix,
-                msix_bundle: file_analyser.msix_bundle,
-                file_name: file
-                    .file_path()
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .map(str::to_owned)
-                    .unwrap(),
-            };
-            Ok::<(&str, InitialData), Error>((url, initial_data))
+            let map = unsafe { Mmap::map(&file) }?;
+            let mut file_analyser =
+                FileAnalyser::new(Cursor::new(map.as_ref()), Cow::Owned(file_name))?;
+            file_analyser.architecture =
+                find_architecture(url.as_str()).or(file_analyser.architecture);
+            file_analyser.installer_sha_256 = sha_256;
+            file_analyser.last_modified = last_modified;
+            Ok((url, file_analyser))
         },
     ))
     .buffered(num_cpus::get())

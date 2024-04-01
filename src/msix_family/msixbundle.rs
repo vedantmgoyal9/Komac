@@ -1,14 +1,14 @@
-use crate::installer_manifest::{Architecture, Platform};
+use crate::manifests::installer_manifest::Platform;
 use crate::msix_family::msix;
-use crate::msix_family::msix_utils::get_manifest_and_signature;
-use async_zip::tokio::read::seek::ZipFileReader;
+use crate::msix_family::utils::{hash_signature, read_manifest};
+use crate::types::architecture::Architecture;
 use color_eyre::eyre::Result;
 use package_family_name::get_package_family_name;
 use quick_xml::de::from_str;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use std::io::{Read, Seek};
 use std::str::FromStr;
-use tokio::fs::File;
+use zip::ZipArchive;
 
 pub struct MsixBundle {
     pub signature_sha_256: String,
@@ -20,31 +20,27 @@ pub struct IndividualPackage {
     pub version: String,
     pub target_device_family: Platform,
     pub min_version: String,
-    pub processor_architecture: Architecture,
+    pub processor_architecture: Option<Architecture>,
 }
 
 const APPX_BUNDLE_MANIFEST_PATH: &str = "AppxMetadata/AppxBundleManifest.xml";
 
 impl MsixBundle {
-    pub async fn new(file: &mut File) -> Result<MsixBundle> {
-        let zip = ZipFileReader::with_tokio(file).await?;
+    pub fn new<R: Read + Seek>(reader: R) -> Result<Self> {
+        let mut zip = ZipArchive::new(reader)?;
 
-        let (appx_bundle_manifest, appx_signature) =
-            get_manifest_and_signature(zip, APPX_BUNDLE_MANIFEST_PATH).await?;
+        let appx_bundle_manifest = read_manifest(&mut zip, APPX_BUNDLE_MANIFEST_PATH)?;
 
-        let signature_hash = Sha256::digest(appx_signature);
-        let signature_sha_256 = base16ct::upper::encode_string(&signature_hash);
+        let signature_sha_256 = hash_signature(&mut zip)?;
 
-        let bundle_manifest: Bundle = from_str(&appx_bundle_manifest)?;
+        let bundle_manifest = from_str::<Bundle>(&appx_bundle_manifest)?;
 
-        let package_family_name = get_package_family_name(
-            &bundle_manifest.identity.name,
-            &bundle_manifest.identity.publisher,
-        );
-
-        Ok(MsixBundle {
+        Ok(Self {
             signature_sha_256,
-            package_family_name,
+            package_family_name: get_package_family_name(
+                &bundle_manifest.identity.name,
+                &bundle_manifest.identity.publisher,
+            ),
             packages: bundle_manifest
                 .packages
                 .package
@@ -56,7 +52,10 @@ impl MsixBundle {
                     )
                     .unwrap(),
                     min_version: package.dependencies.target_device_family.min_version,
-                    processor_architecture: Architecture::from_str(&package.architecture).unwrap(),
+                    processor_architecture: package
+                        .architecture
+                        .as_deref()
+                        .and_then(|architecture| Architecture::from_str(architecture).ok()),
                 })
                 .collect(),
         })
@@ -93,7 +92,7 @@ struct Package {
     #[serde(rename = "@Version")]
     version: String,
     #[serde(rename = "@Architecture")]
-    architecture: String,
+    architecture: Option<String>,
     #[serde(rename = "Dependencies")]
     dependencies: msix::Dependencies,
 }

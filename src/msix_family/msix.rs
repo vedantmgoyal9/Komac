@@ -1,14 +1,14 @@
-use crate::installer_manifest::{Architecture, Platform};
-use crate::msix_family::msix_utils::get_manifest_and_signature;
+use crate::manifests::installer_manifest::Platform;
+use crate::msix_family::utils::{hash_signature, read_manifest};
+use crate::types::architecture::Architecture;
 use crate::types::minimum_os_version::MinimumOSVersion;
-use async_zip::tokio::read::seek::ZipFileReader;
 use color_eyre::eyre::Result;
 use package_family_name::get_package_family_name;
 use quick_xml::de::from_str;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use std::io::{Read, Seek};
 use std::str::FromStr;
-use tokio::fs::File;
+use zip::ZipArchive;
 
 pub struct Msix {
     pub display_name: String,
@@ -22,28 +22,27 @@ pub struct Msix {
 }
 
 const APPX_MANIFEST_XML: &str = "AppxManifest.xml";
+pub const APPX_SIGNATURE_P7X: &str = "AppxSignature.p7x";
 
 impl Msix {
-    pub async fn new(file: &mut File) -> Result<Msix> {
-        let zip = ZipFileReader::with_tokio(file).await?;
+    pub fn new<R: Read + Seek>(reader: R) -> Result<Self> {
+        let mut zip = ZipArchive::new(reader)?;
 
-        let (appx_manifest, appx_signature) =
-            get_manifest_and_signature(zip, APPX_MANIFEST_XML).await?;
+        let appx_manifest = read_manifest(&mut zip, APPX_MANIFEST_XML)?;
 
-        let signature_hash = Sha256::digest(appx_signature);
-        let signature_sha_256 = base16ct::upper::encode_string(&signature_hash);
+        let signature_sha_256 = hash_signature(&mut zip)?;
 
-        let manifest: Package = from_str(&appx_manifest)?;
+        let manifest = from_str::<Package>(&appx_manifest)?;
 
-        let package_family_name =
-            get_package_family_name(&manifest.identity.name, &manifest.identity.publisher);
-
-        Ok(Msix {
+        Ok(Self {
             display_name: manifest.properties.display_name,
             publisher_display_name: manifest.properties.publisher_display_name,
             version: manifest.identity.version,
             signature_sha_256,
-            package_family_name,
+            package_family_name: get_package_family_name(
+                &manifest.identity.name,
+                &manifest.identity.publisher,
+            ),
             target_device_family: Platform::from_str(
                 &manifest.dependencies.target_device_family.name,
             )?,

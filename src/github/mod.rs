@@ -1,2 +1,3 @@
 pub mod github_client;
-pub mod github_utils;
+pub mod graphql;
+pub mod utils;
