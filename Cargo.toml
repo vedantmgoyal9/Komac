@@ -1,6 +1,6 @@
 [package]
 name = "komac"
-version = "2.2.0"
+version = "2.3.0"
 authors = ["Russell Banks"]
 edition = "2021"
 description = "A manifest creator for winget-pkgs"
@@ -26,80 +26,66 @@ strip = true
 base16ct = { version = "0.2.0", features = ["std"] }
 base64ct = { version = "1.6.0", features = ["std"] }
 bitflags = "2.5.0"
-camino = { version = "1.1.6", features = ["serde1"] }
-chrono = { version = "0.4.37", features = ["serde"] }
-clap = { version = "4.5.4", features = ["derive", "cargo", "env"] }
+camino = { version = "1.1.7", features = ["serde1"] }
+chrono = { version = "0.4.38", features = ["serde"] }
+clap = { version = "4.5.7", features = ["derive", "cargo", "env"] }
 color-eyre = { version = "0.6.3", default-features = false }
 const_format = "0.2.32"
 crossterm = "0.27.0"
-cynic = { version = "3.5.0", features = ["http-reqwest"] }
-derive_more = "0.99.17"
+cynic = { version = "3.7.3", features = ["http-reqwest"] }
+derive_more = "0.99.18"
 futures = "0.3.30"
 futures-util = "0.3.30"
 heapless = "0.8.0"
 indexmap = "2.2.6"
 indicatif = "0.17.8"
-inquire = "0.7.4"
+inquire = "0.7.5"
 itertools = "0.12.1"
-keyring = "2.3.2"
+keyring = "2.3.3"
 memmap2 = "0.9.4"
 msi = "0.7.0"
-num-traits = "0.2.18"
 num_cpus = "1.16.0"
-nutype = { version = "0.4.0", features = ["serde"] }
-object = "0.34.0"
-open = "5.1.2"
+nutype = { version = "0.4.2", features = ["serde"] }
+once_cell = "1.19.0"
+open = "5.1.4"
 ordinal = "0.3.2"
 oxilangtag = { version = "0.1.5", features = ["serde"] }
 package-family-name = "1.1.0"
 percent-encoding = "2.3.1"
-pulldown-cmark = "0.10.0"
-quick-xml = { version = "0.31.0", features = ["serialize"] }
+pulldown-cmark = "0.11.0"
+quick-xml = { version = "0.33.0", features = ["serialize"] }
 rand = "0.8.5"
-reqwest = { version = "0.12.2", features = ["stream"] }
-serde = { version = "1.0.197", features = ["derive"] }
-serde_json = "1.0.115"
-serde_with = { version = "3.7.0", features = ["macros"] }
+ratatui = "0.26.3"
+reqwest = { version = "0.12.5", features = ["native-tls-vendored", "stream"] }
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = "1.0.117"
+serde_with = { version = "3.8.1", default-features = false, features = ["macros"] }
 serde_yaml = "0.9.34"
 sha2 = "0.10.8"
+strsim = "0.11.1"
 strum = { version = "0.26.2", features = ["derive"] }
 tempfile = "3.10.1"
-thiserror = "1.0.58"
-tokio = { version = "1.37.0", features = ["rt-multi-thread", "macros", "fs"] }
-url = { version = "2.5.0", features = ["serde"] }
+thiserror = "1.0.61"
+tokio = { version = "1.38.0", features = ["rt-multi-thread", "macros", "fs"] }
+tree-sitter-highlight = "0.22.6"
+tree-sitter-yaml = "0.6.1"
+tui-textarea = { version = "0.4.0", features = ["search"] }
+url = { version = "2.5.2", features = ["serde"] }
 uuid = { version = "1.8.0", features = ["v4"] }
-versions = "6.2.0"
-zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+versions = "6.3.0"
+yara-x = { version = "0.4.0", default-features = false, features = ["pe-module"] }
+zip = { version = "2.1.3", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
-cynic-codegen = { version = "3.5.0", features = ["rkyv"] }
+cynic-codegen = { version = "3.7.2", features = ["rkyv"] }
 windows_exe_info = { version = "0.4.2", features = ["manifest"] }
 
 [dev-dependencies]
 indoc = "2.0.5"
-rstest = "0.18.2"
+rstest = "0.21.0"
 sha1 = "0.10.6"
 
-[package.metadata.cross.target.x86_64-unknown-linux-gnu]
-pre-build = [
-    "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update && apt-get install --assume-yes libssl-dev:$CROSS_DEB_ARCH"
-]
-
-[package.metadata.cross.target.i686-unknown-linux-gnu]
-pre-build = [
-    "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update && apt-get install --assume-yes libssl-dev:$CROSS_DEB_ARCH"
-]
-
-[package.metadata.cross.target.aarch64-unknown-linux-gnu]
-pre-build = [
-    "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update && apt-get install --assume-yes libssl-dev:$CROSS_DEB_ARCH"
-]
-
-[package.metadata.cross.target.armv7-unknown-linux-gnueabihf]
-pre-build = [
-    "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update && apt-get install --assume-yes libssl-dev:$CROSS_DEB_ARCH"
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/komac", dest = "/usr/bin/komac", mode = "755" },
 ]

@@ -15,7 +15,10 @@ use ordinal::Ordinal;
 use reqwest::Client;
 use strum::IntoEnumIterator;
 
-use crate::commands::utils::{prompt_existing_pull_request, reorder_keys, write_changes_to_dir};
+use crate::commands::utils::{
+    prompt_existing_pull_request, prompt_submit_option, reorder_keys, write_changes_to_dir,
+    SubmitOption,
+};
 use crate::credential::{get_default_headers, handle_token};
 use crate::download_file::{download_urls, process_files};
 use crate::github::github_client::{GitHub, WINGET_PKGS_FULL_NAME};
@@ -23,7 +26,7 @@ use crate::github::graphql::create_commit::{Base64String, FileAddition};
 use crate::github::utils::{
     get_branch_name, get_commit_title, get_package_path, get_pull_request_body,
 };
-use crate::manifest::{build_manifest_string, print_changes, Manifest};
+use crate::manifest::{build_manifest_string, Manifest};
 use crate::manifests::default_locale_manifest::DefaultLocaleManifest;
 use crate::manifests::installer_manifest::{
     AppsAndFeaturesEntry, InstallModes, Installer, InstallerManifest, InstallerSwitches, Scope,
@@ -67,7 +70,7 @@ use crate::update_state::UpdateState;
 #[derive(Parser)]
 pub struct NewVersion {
     /// The package's unique identifier
-    #[arg(short = 'i', long = "identifier")]
+    #[arg()]
     package_identifier: Option<PackageIdentifier>,
 
     /// The package's version
@@ -148,7 +151,11 @@ pub struct NewVersion {
     #[arg(long, env = "OPEN_PR")]
     open_pr: bool,
 
-    /// GitHub personal access token with the public_repo and read_org scope
+    /// Run without submitting
+    #[arg(long, env = "DRY_RUN")]
+    dry_run: bool,
+
+    /// GitHub personal access token with the `public_repo` scope
     #[arg(short, long, env = "GITHUB_TOKEN")]
     token: Option<String>,
 }
@@ -156,7 +163,7 @@ pub struct NewVersion {
 impl NewVersion {
     pub async fn run(self) -> Result<()> {
         let token = handle_token(self.token).await?;
-        let github = GitHub::new(token)?;
+        let github = GitHub::new(&token)?;
         let client = Client::builder()
             .default_headers(get_default_headers(None))
             .build()?;
@@ -183,7 +190,12 @@ impl NewVersion {
             .get_existing_pull_request(&package_identifier, &package_version)
             .await?
         {
-            if !prompt_existing_pull_request(&package_identifier, &package_version, &pull_request)?
+            if !self.dry_run
+                && !prompt_existing_pull_request(
+                    &package_identifier,
+                    &package_version,
+                    &pull_request,
+                )?
             {
                 return Ok(());
             }
@@ -211,7 +223,7 @@ impl NewVersion {
         }
 
         let multi_progress = MultiProgress::new();
-        let files = stream::iter(download_urls(&client, urls, &multi_progress))
+        let mut files = stream::iter(download_urls(&client, urls, &multi_progress))
             .buffer_unordered(self.concurrent_downloads.get() as usize)
             .try_collect::<Vec<_>>()
             .await?;
@@ -227,7 +239,7 @@ impl NewVersion {
                     parts[4..parts.len() - 1].join("/"),
                 )
             });
-        let mut download_results = process_files(files).await?;
+        let mut download_results = process_files(&mut files).await?;
         let mut installers = BTreeSet::new();
         for (url, analyser) in &mut download_results {
             if analyser.installer_type == InstallerType::Exe
@@ -246,6 +258,7 @@ impl NewVersion {
             }
             if let Some(zip) = &mut analyser.zip {
                 zip.prompt()?;
+                analyser.architecture = zip.architecture;
             }
             installers.insert(Installer {
                 installer_locale: mem::take(&mut analyser.product_language),
@@ -261,16 +274,18 @@ impl NewVersion {
                     .zip
                     .as_mut()
                     .and_then(|zip| mem::take(&mut zip.nested_installer_files)),
-                scope: mem::take(&mut analyser.scope)
-                    .or_else(|| Scope::find_from_url(url.as_str())),
+                scope: mem::take(&mut analyser.scope).or_else(|| Scope::get_from_url(url.as_str())),
                 installer_url: url.clone(),
                 installer_sha_256: mem::take(&mut analyser.installer_sha_256),
                 signature_sha_256: mem::take(&mut analyser.signature_sha_256),
                 installer_switches: installer_switches
                     .is_any_some()
                     .then_some(installer_switches),
+                file_extensions: mem::take(&mut analyser.file_extensions),
                 package_family_name: mem::take(&mut analyser.package_family_name),
                 product_code: mem::take(&mut analyser.product_code),
+                capabilities: mem::take(&mut analyser.capabilities),
+                restricted_capabilities: mem::take(&mut analyser.restricted_capabilities),
                 release_date: analyser.last_modified,
                 apps_and_features_entries: analyser.msi.as_mut().map(|msi| {
                     BTreeSet::from([AppsAndFeaturesEntry {
@@ -306,7 +321,14 @@ impl NewVersion {
             upgrade_behavior: Some(radio_prompt::<UpgradeBehavior>()?),
             commands: list_prompt::<Command>()?,
             protocols: list_prompt::<Protocol>()?,
-            file_extensions: list_prompt::<FileExtension>()?,
+            file_extensions: if installers
+                .iter()
+                .all(|installer| installer.file_extensions.is_none())
+            {
+                list_prompt::<FileExtension>()?
+            } else {
+                None
+            },
             manifest_type: ManifestType::Installer,
             ..InstallerManifest::default()
         };
@@ -365,7 +387,7 @@ impl NewVersion {
         };
 
         let full_package_path = get_package_path(&package_identifier, Some(&package_version));
-        let changes = {
+        let mut changes = {
             let mut path_content_map = Vec::new();
             path_content_map.push((
                 format!("{full_package_path}/{package_identifier}.installer.yaml"),
@@ -414,7 +436,13 @@ impl NewVersion {
             path_content_map
         };
 
-        print_changes(changes.iter().map(|(_, content)| content.as_str()));
+        let submit_option = prompt_submit_option(
+            &mut changes,
+            self.submit,
+            &package_identifier,
+            &package_version,
+            self.dry_run,
+        )?;
 
         if let Some(output) = self.output.map(|out| out.join(full_package_path)) {
             write_changes_to_dir(&changes, output.as_path()).await?;
@@ -424,15 +452,7 @@ impl NewVersion {
             );
         }
 
-        let should_remove_manifest = if self.submit {
-            true
-        } else {
-            Confirm::new(&format!(
-                "Would you like to make a pull request for {package_identifier} {package_version}?"
-            ))
-            .prompt()?
-        };
-        if !should_remove_manifest {
+        if submit_option == SubmitOption::Exit {
             return Ok(());
         }
 

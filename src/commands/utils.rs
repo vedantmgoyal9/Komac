@@ -1,5 +1,7 @@
+use crate::editor::Editor;
 use crate::github::graphql::get_existing_pull_request::PullRequest;
 use crate::github::graphql::get_pull_request_from_branch::PullRequestState;
+use crate::manifest::print_changes;
 use crate::manifests::installer_manifest::{Installer, InstallerManifest, InstallerSwitches};
 use crate::types::manifest_version::ManifestVersion;
 use crate::types::package_identifier::PackageIdentifier;
@@ -8,12 +10,13 @@ use camino::Utf8Path;
 use color_eyre::Result;
 use crossterm::style::Stylize;
 use futures_util::{stream, StreamExt, TryStreamExt};
-use inquire::Confirm;
+use inquire::{Confirm, Select};
 use itertools::Itertools;
 use std::collections::BTreeSet;
 use std::ops::Not;
 use std::str::FromStr;
 use std::{env, mem};
+use strum::{Display, EnumIter, IntoEnumIterator};
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -42,6 +45,45 @@ pub fn prompt_existing_pull_request(
     Ok(proceed)
 }
 
+pub fn prompt_submit_option(
+    changes: &mut [(String, String)],
+    submit: bool,
+    identifier: &PackageIdentifier,
+    version: &PackageVersion,
+    dry_run: bool,
+) -> Result<SubmitOption> {
+    let mut submit_option;
+    loop {
+        print_changes(changes.iter().map(|(_, content)| content.as_str()));
+
+        submit_option = if dry_run {
+            SubmitOption::Exit
+        } else if submit {
+            SubmitOption::Submit
+        } else {
+            Select::new(
+                &format!("What would you like to do with {identifier} {version}?"),
+                SubmitOption::iter().collect(),
+            )
+            .prompt()?
+        };
+
+        if submit_option == SubmitOption::Edit {
+            Editor::new(changes)?.run()?;
+        } else {
+            break;
+        }
+    }
+    Ok(submit_option)
+}
+
+#[derive(Display, EnumIter, Eq, PartialEq)]
+pub enum SubmitOption {
+    Submit,
+    Edit,
+    Exit,
+}
+
 pub async fn write_changes_to_dir(changes: &[(String, String)], output: &Utf8Path) -> Result<()> {
     fs::create_dir_all(output).await?;
     stream::iter(changes.iter())
@@ -60,7 +102,7 @@ pub async fn write_changes_to_dir(changes: &[(String, String)], output: &Utf8Pat
 pub fn reorder_keys(
     package_identifier: PackageIdentifier,
     package_version: PackageVersion,
-    installers: BTreeSet<Installer>,
+    mut installers: BTreeSet<Installer>,
     mut installer_manifest: InstallerManifest,
 ) -> InstallerManifest {
     macro_rules! root_manifest_key {
@@ -145,13 +187,16 @@ pub fn reorder_keys(
         apps_and_features_entries: root_manifest_key!(apps_and_features_entries),
         elevation_requirement: root_manifest_key!(elevation_requirement),
         installation_metadata: root_manifest_key!(installation_metadata),
-        installers: remove_non_distinct_keys(installers),
+        installers: {
+            remove_non_distinct_keys(&mut installers);
+            installers
+        },
         manifest_version: ManifestVersion::default(),
         ..installer_manifest
     }
 }
 
-fn remove_non_distinct_keys(installers: BTreeSet<Installer>) -> BTreeSet<Installer> {
+fn remove_non_distinct_keys(installers: &mut BTreeSet<Installer>) {
     macro_rules! installer_key {
         ($item: expr, $field: ident) => {
             installers
@@ -185,7 +230,7 @@ fn remove_non_distinct_keys(installers: BTreeSet<Installer>) -> BTreeSet<Install
         };
     }
 
-    installers
+    *installers = installers
         .iter()
         .cloned()
         .map(|mut installer| Installer {
@@ -231,5 +276,5 @@ fn remove_non_distinct_keys(installers: BTreeSet<Installer>) -> BTreeSet<Install
             installation_metadata: installer_key!(installer, installation_metadata),
             ..installer
         })
-        .collect()
+        .collect();
 }

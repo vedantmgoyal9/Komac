@@ -6,9 +6,8 @@ on:
     branches: [ main ]
     types:
       - completed
-  push:
-    tags:
-      - "v*.*.*"
+  release:
+    types: [ released ]
 
 permissions:
   contents: write
@@ -28,58 +27,22 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             arch: x64
-            os_name: windows
-            bins: cross
-          - os: windows-latest
-            target: i686-pc-windows-msvc
-            arch: x86
-            os_name: windows
-            bins: cross
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             arch: arm64
-            os_name: windows
-            bins: cross
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            arch: x64
-            os_name: linux
-            bins: cargo-deb, cross
-          - os: ubuntu-latest
-            target: i686-unknown-linux-gnu
-            arch: x86
-            os_name: linux
-            bins: cargo-deb, cross
+            bins: cargo-deb, cargo-generate-rpm
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            arch: arm64
-            os_name: linux
-            bins: cargo-deb, cross
-          - os: ubuntu-latest
-            target: armv7-unknown-linux-gnueabihf
-            arch: armv7
-            os_name: linux
-            bins: cargo-deb, cross
+            bins: cross, cargo-deb, cargo-generate-rpm
           - os: ubuntu-latest
             target: x86_64-unknown-freebsd
-            arch: x64
-            os_name: freebsd
-            bins: cross
-          - os: ubuntu-latest
-            target: i686-unknown-freebsd
-            arch: x86
-            os_name: freebsd
             bins: cross
           - os: macos-latest
             target: x86_64-apple-darwin
-            arch: x64
-            os_name: macos
-            bins: cross
           - os: macos-latest
             target: aarch64-apple-darwin
-            arch: arm64
-            os_name: macos
-            bins: cross
 
     runs-on: ${{ matrix.platform.os }}
     steps:
@@ -93,56 +56,66 @@ jobs:
           cache: false
 
       - name: Build binary
-        run: cross build --target ${{ matrix.platform.target }} --release --locked
+        shell: pwsh
+        run: |
+          $tool = if ("${{ matrix.platform.bins }}".Contains("cross")) { "cross" } else { "cargo" }
+          & $tool build --target ${{ matrix.platform.target }} --release --locked
 
       - name: Create Deb package
-        if: ${{ matrix.platform.os_name == 'linux' }}
+        if: contains(matrix.platform.bins, 'cargo-deb')
+        shell: pwsh
         run: |
-          if [ ${{ github.event_name }} == 'workflow_run' ]; then
-            cargo deb --target ${{ matrix.platform.target }} --no-build --no-strip --deb-version="nightly"
-          else
-            cargo deb --target ${{ matrix.platform.target }} --no-build --no-strip
-          fi
+          $nightly = if ($env:GITHUB_EVENT_NAME -eq 'workflow_run') { "--deb-version=nightly" } else { "" }
+          cargo deb --target ${{ matrix.platform.target }} --no-build --no-strip $nightly
+
+      - name: Create RPM package
+        if: contains(matrix.platform.bins, 'cargo-generate-rpm')
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_run') {
+            cargo generate-rpm --target ${{ matrix.platform.target }} --set-metadata='version="nightly"'
+          } else {
+            cargo generate-rpm --target ${{ matrix.platform.target }}
+          }
 
       - name: Rename binary
         id: rename_binary
         shell: pwsh
         run: |
           $bin = if ($env:RUNNER_OS -eq 'Windows') { "komac.exe" } else { "komac" }
-          $newName = "KomacPortable"
-          if ($env:RUNNER_OS -ne 'Windows') {
-            $newName += "-${{ matrix.platform.os_name }}"
-          }
+          $newName = "komac"
           if ($env:GITHUB_EVENT_NAME -eq 'workflow_run') {
             $newName += "-nightly"
+          } else {
+            $newName += "-$($env:GITHUB_REF_NAME.TrimStart('v'))"
           }
-          $newName += "-${{ matrix.platform.arch }}"
+          $newName += "-${{ matrix.platform.target }}"
           if ($env:RUNNER_OS -eq 'Windows') {
             $newName += ".exe"
+            Rename-Item -Path "target/${{ matrix.platform.target }}/release/$bin" -NewName "$newName"
           }
-          Rename-Item -Path "target/${{ matrix.platform.target }}/release/$bin" -NewName "$newName"
           "name=$newName" >> $env:GITHUB_OUTPUT
 
       - name: Create Tar archive
-        if: ${{ matrix.platform.os != 'windows-latest' }}
+        if: ${{ runner.os != 'Windows' }}
         run: |
-          tar -czvf ${{ steps.rename_binary.outputs.name }}.tar.gz -C target/${{ matrix.platform.target }}/release ${{ steps.rename_binary.outputs.name }}
-          rm target/${{ matrix.platform.target }}/release/${{ steps.rename_binary.outputs.name }}
+          tar -czvf ${{ steps.rename_binary.outputs.name }}.tar.gz -C target/${{ matrix.platform.target }}/release komac
+          rm target/${{ matrix.platform.target }}/release/komac
 
       - name: Create Inno Installer
-        if: ${{ matrix.platform.os == 'windows-latest' }}
+        if: ${{ runner.os == 'Windows' }}
         shell: pwsh
         run: |
           $input = "../target/${{ matrix.platform.target }}/release/${{ steps.rename_binary.outputs.name }}"
           iscc.exe assets/installer.iss `
             /DInputExecutable=$input `
             /DArchitecture=${{ matrix.platform.arch }} `
-            /F$("${{ steps.rename_binary.outputs.name }}".Replace("Portable", "Setup").TrimEnd(".exe"))
+            /F$("${{ steps.rename_binary.outputs.name }}".Replace("komac", "komac-setup").TrimEnd(".exe"))
 
       - name: Compute SHA256 checksum
         shell: pwsh
         run: |
-          Get-Item -ErrorAction SilentlyContinue -Path "${{ steps.rename_binary.outputs.name }}.tar.gz","assets/Output/*","target/${{ matrix.platform.target }}/release/*","target/${{ matrix.platform.target }}/debian/*" -Include "KomacPortable*","KomacSetup*","komac*.deb" | ForEach-Object {
+          Get-Item -ErrorAction SilentlyContinue -Path "${{ steps.rename_binary.outputs.name }}.tar.gz","assets/Output/*","target/${{ matrix.platform.target }}/release/*","target/${{ matrix.platform.target }}/debian/*","target/${{ matrix.platform.target }}/generate-rpm/*" -Include "komac-*", "komac*.deb", "komac*.rpm" | ForEach-Object {
             $FileHash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLower()
             New-Item -Force -ItemType File -Path $_.DirectoryName -Name "$($_.Name).sha256" -Value "$FileHash *$($_.Name)`n"
           }
@@ -173,6 +146,8 @@ jobs:
             target/${{ matrix.platform.target }}/release/${{ steps.rename_binary.outputs.name }}.sha256
             target/${{ matrix.platform.target }}/debian/*.deb
             target/${{ matrix.platform.target }}/debian/*.sha256
+            target/${{ matrix.platform.target }}/generate-rpm/*.rpm
+            target/${{ matrix.platform.target }}/generate-rpm/*.sha256
             ${{ steps.rename_binary.outputs.name }}.tar.gz
             ${{ steps.rename_binary.outputs.name }}.tar.gz.sha256
             assets/Output/*
@@ -185,7 +160,7 @@ jobs:
       - uses: vedantmgoyal2009/winget-releaser@v2
         with:
           identifier: RussellBanks.Komac
-          installers-regex: 'KomacSetup.*\.exe$'
+          installers-regex: 'komac-setup.*\.exe$'
           token: ${{ secrets.WINGET_TOKEN }}
 
   publish-homebrew-tap:
@@ -212,4 +187,22 @@ jobs:
           files: |
             .exe$
             .deb$
+            .rpm$
             .tar.gz$
+
+  publish-crates-io:
+    needs: release
+    if: ${{ github.event_name != 'workflow_run' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - uses: moonrepo/setup-rust@v1
+        with:
+          cache: false
+
+      - name: Publish to crates.io
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

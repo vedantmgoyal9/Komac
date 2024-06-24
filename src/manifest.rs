@@ -1,14 +1,18 @@
+use std::io::StdoutLock;
+use std::io::Write;
+use std::{env, io};
+
+use clap::{crate_name, crate_version};
+use color_eyre::eyre::{Error, Result};
+use const_format::formatcp;
+use crossterm::style::{style, Color, Stylize};
+use once_cell::sync::Lazy;
+use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
+
 use crate::manifests::default_locale_manifest::DefaultLocaleManifest;
 use crate::manifests::installer_manifest::InstallerManifest;
 use crate::manifests::locale_manifest::LocaleManifest;
 use crate::manifests::version_manifest::VersionManifest;
-use clap::{crate_name, crate_version};
-use color_eyre::eyre::{Error, Result};
-use const_format::formatcp;
-use crossterm::style::Stylize;
-use std::io::StdoutLock;
-use std::io::Write;
-use std::{env, io};
 
 pub const MANIFEST_VERSION: &str = "1.6.0";
 
@@ -49,17 +53,63 @@ pub fn print_changes<'a>(contents: impl Iterator<Item = &'a str>) {
 }
 
 fn print_manifest(lock: &mut StdoutLock, manifest: &str) {
-    for line in manifest.lines() {
-        if line.starts_with('#') {
-            let _ = writeln!(lock, "{}", line.green());
-        } else if let Some((prefix, suffix)) = line.split_once(':') {
-            if let Some((before_dash, after_dash)) = prefix.split_once('-') {
-                let _ = writeln!(lock, "{before_dash}-{}:{suffix}", after_dash.blue());
-            } else {
-                let _ = writeln!(lock, "{}:{suffix}", prefix.blue());
+    const COMMENT: &str = "comment";
+    const PROPERTY: &str = "property";
+    const STRING: &str = "string";
+    const HIGHLIGHT_NAMES: [&str; 3] = [COMMENT, STRING, PROPERTY];
+    const YAML: &str = "yaml";
+
+    static YAML_CONFIG: Lazy<HighlightConfiguration> = Lazy::new(|| {
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_yaml::language(),
+            YAML,
+            tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            <&str>::default(),
+            <&str>::default(),
+        )
+        .unwrap();
+        config.configure(&HIGHLIGHT_NAMES);
+        config
+    });
+
+    let mut highlighter = Highlighter::new();
+    let highlights = highlighter
+        .highlight(&YAML_CONFIG, manifest.as_bytes(), None, |_| None)
+        .unwrap();
+
+    let mut current_highlight = None;
+    for event in highlights {
+        match event {
+            Ok(HighlightEvent::Source { start, end }) => {
+                let source = &manifest[start..end];
+                let _ = write!(
+                    lock,
+                    "{}",
+                    style(source).with(
+                        current_highlight
+                            .and_then(|value: Highlight| {
+                                match HIGHLIGHT_NAMES[value.0] {
+                                    COMMENT => Some(Color::DarkGrey),
+                                    PROPERTY => Some(Color::Green),
+                                    STRING => {
+                                        if source.chars().all(|char| {
+                                            char.is_ascii_digit() || char.is_ascii_punctuation()
+                                        }) {
+                                            Some(Color::Blue)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                }
+                            })
+                            .unwrap_or(Color::Reset)
+                    )
+                );
             }
-        } else {
-            let _ = writeln!(lock, "{line}");
+            Ok(HighlightEvent::HighlightStart(highlight)) => current_highlight = Some(highlight),
+            Ok(HighlightEvent::HighlightEnd) => current_highlight = None,
+            Err(_) => continue,
         }
     }
 }
@@ -91,25 +141,25 @@ fn convert_to_crlf(buf: &mut Vec<u8>) {
     const CARRIAGE_RETURN: u8 = b'\r';
 
     let mut prev_char: Option<u8> = None;
-    let mut i = 0;
-    while i < buf.len() {
+    let mut index = 0;
+    while index < buf.len() {
         // Check whether the character is a newline and is not preceded by a carriage return
-        if buf[i] == NEWLINE && prev_char != Some(CARRIAGE_RETURN) {
+        if buf[index] == NEWLINE && prev_char != Some(CARRIAGE_RETURN) {
             // Insert a carriage return before the newline
-            buf.insert(i, CARRIAGE_RETURN);
-            i += 1; // Move to the next character to avoid infinite loop
+            buf.insert(index, CARRIAGE_RETURN);
+            index += 1; // Move to the next character to avoid infinite loop
         }
-        prev_char = Some(buf[i]);
-        i += 1;
+        prev_char = Some(buf[index]);
+        index += 1;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::manifest::{build_manifest_string, Manifest};
-    use crate::manifests::installer_manifest::InstallerManifest;
+    use crate::manifest::convert_to_crlf;
+    use std::io::Write;
 
-    fn contains_newline_not_preceded_by_carriage_return(value: &str) -> bool {
+    fn is_line_feed(value: &str) -> bool {
         value
             .chars()
             .zip(value.chars().skip(1))
@@ -117,12 +167,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_manifest_string_crlf() {
-        let binding = InstallerManifest::default();
-        let installer_manifest = Manifest::Installer(&binding);
-        let manifest_string = build_manifest_string(&installer_manifest, &None).unwrap();
-        assert!(!contains_newline_not_preceded_by_carriage_return(
-            &manifest_string
-        ));
+    fn test_convert_to_crlf() {
+        let mut buffer = Vec::new();
+        for index in 0..10 {
+            let _ = writeln!(buffer, "Line {index}");
+        }
+        let lf_string = String::from_utf8_lossy(&buffer);
+        assert!(is_line_feed(&lf_string));
+        convert_to_crlf(&mut buffer);
+        let crlf_string = String::from_utf8_lossy(&buffer);
+        assert!(!is_line_feed(&crlf_string));
     }
 }

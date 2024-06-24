@@ -19,7 +19,7 @@ use std::time::Duration;
 #[derive(Parser)]
 pub struct RemoveVersion {
     /// The package's unique identifier
-    #[arg(short = 'i', long = "identifier")]
+    #[arg()]
     package_identifier: PackageIdentifier,
 
     /// The package's version
@@ -40,7 +40,7 @@ pub struct RemoveVersion {
     #[arg(long, env = "OPEN_PR")]
     open_pr: bool,
 
-    /// GitHub personal access token with the public_repo and read_org scope
+    /// GitHub personal access token with the `public_repo` scope
     #[arg(short, long, env = "GITHUB_TOKEN")]
     token: Option<String>,
 }
@@ -56,7 +56,7 @@ impl RemoveVersion {
             "Packages should only be removed when necessary".yellow()
         );
         println!();
-        let github = GitHub::new(token)?;
+        let github = GitHub::new(&token)?;
         let versions = github
             .get_versions(&get_package_path(&self.package_identifier, None))
             .await
